@@ -1,0 +1,9 @@
+{
+  "name": "vulnerable-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "lodash": "4.17.20"
+  }
+}

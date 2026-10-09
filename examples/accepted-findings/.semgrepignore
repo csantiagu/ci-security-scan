@@ -1,0 +1,8 @@
+# Paths Semgrep skips. Put this file at the repo root. It replaces Semgrep's built-in defaults,
+# so include .gitignore to keep skipping build output and dependencies.
+:include .gitignore
+
+# Test code and fixtures: not shipped.
+src/test/
+*.test.ts
+*.test.tsx

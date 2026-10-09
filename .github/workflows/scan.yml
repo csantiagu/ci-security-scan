@@ -1,0 +1,479 @@
+name: Security scan
+
+# Reusable workflow: call it from your own repo with `uses: csantiagu/ci-security-scan/.github/workflows/scan.yml@v1`.
+# See the README for every input.
+#
+# What runs (a scan is skipped when its input is empty or false):
+# - maven:   OSV-Scanner on a CycloneDX SBOM of the runtime classpath (test scope excluded).
+# - npm:     `npm audit` on production dependencies only. Nothing is installed; no package scripts run.
+# - secrets: gitleaks over the full git history. A secret deleted in a later commit is still exposed.
+# - code:    Semgrep registry rules. Only rule IDs are downloaded; --metrics=off sends nothing back.
+# - image:   Trivy on a Docker image built from your Dockerfile (OS packages + application libraries).
+# - config:  Trivy misconfiguration checks on Dockerfiles, Compose, Kubernetes and IaC files.
+#
+# Scan jobs only fail when a scanner itself errors. Findings are counted, annotated and passed to the
+# `verdict` job, which fails the run unless `fail-on-findings` is false. Make `verdict` your one
+# required status check.
+#
+# Every scanner image is pinned by digest, so a re-pointed tag cannot change what runs.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to check out. Empty means the commit that triggered the caller.
+        type: string
+        default: ""
+      fail-on-findings:
+        description: Fail the run when any scanner reports findings. Set false for report-only mode.
+        type: boolean
+        default: true
+      artifact-prefix:
+        description: Prefix for the SARIF artifacts. Change it if you call this workflow twice in one run.
+        type: string
+        default: security-scan
+
+      maven-dir:
+        description: Folder holding the root pom.xml. Empty skips the Maven dependency scan.
+        type: string
+        default: ""
+      java-version:
+        description: JDK used to resolve Maven dependencies.
+        type: string
+        default: "21"
+      osv-config:
+        description: OSV-Scanner config with accepted vulnerabilities. Default is <maven-dir>/osv-scanner.toml, when present.
+        type: string
+        default: ""
+
+      npm-dir:
+        description: Folder holding package.json and package-lock.json. Empty skips the npm audit.
+        type: string
+        default: ""
+      node-version:
+        description: Node.js version used to run npm audit.
+        type: string
+        default: "24"
+      npm-audit-level:
+        description: Lowest severity that counts as a finding (low, moderate, high or critical).
+        type: string
+        default: high
+
+      secrets-scan:
+        description: Scan the full git history for secrets with gitleaks.
+        type: boolean
+        default: true
+      gitleaks-config:
+        description: gitleaks config file, used when present.
+        type: string
+        default: .gitleaks.toml
+      gitleaks-ignore:
+        description: gitleaks file of reviewed findings (fingerprints), used when present.
+        type: string
+        default: .gitleaksignore
+
+      code-scan:
+        description: Scan source code with Semgrep.
+        type: boolean
+        default: true
+      source-dir:
+        description: Folder that the Semgrep and Trivy config scans cover.
+        type: string
+        default: .
+      semgrep-config:
+        description: Space-separated Semgrep rule packs, e.g. "p/java p/typescript p/owasp-top-ten".
+        type: string
+        default: p/default
+      semgrep-severity:
+        description: Lowest Semgrep rule severity to run (INFO, WARNING or ERROR).
+        type: string
+        default: ERROR
+
+      image-context:
+        description: Docker build context for the image scan. Empty skips the image scan.
+        type: string
+        default: ""
+      image-dockerfile:
+        description: Dockerfile for the image scan. Default is <image-context>/Dockerfile.
+        type: string
+        default: ""
+      config-scan:
+        description: Scan Dockerfiles, Compose, Kubernetes and IaC files for misconfigurations with Trivy.
+        type: boolean
+        default: true
+      trivy-ignore:
+        description: Trivy ignore file (.trivyignore.yaml) for accepted findings, used when present.
+        type: string
+        default: .trivyignore.yaml
+
+    outputs:
+      maven-findings:
+        description: Number of vulnerable Maven packages (empty when skipped).
+        value: ${{ jobs.maven.outputs.findings }}
+      npm-findings:
+        description: Number of npm vulnerabilities at or above npm-audit-level (empty when skipped).
+        value: ${{ jobs.npm.outputs.findings }}
+      secrets-findings:
+        description: Number of secrets found in git history (empty when skipped).
+        value: ${{ jobs.secrets.outputs.findings }}
+      code-findings:
+        description: Number of Semgrep findings (empty when skipped).
+        value: ${{ jobs.code.outputs.findings }}
+      image-findings:
+        description: Number of fixable HIGH/CRITICAL image vulnerabilities (empty when skipped).
+        value: ${{ jobs.image.outputs.findings }}
+      config-findings:
+        description: Number of HIGH/CRITICAL misconfigurations (empty when skipped).
+        value: ${{ jobs.config.outputs.findings }}
+
+permissions:
+  contents: read
+
+env:
+  # Renovate keeps these current (see renovate.json). Bump the tag and digest together.
+  OSV_SCANNER_IMAGE: ghcr.io/google/osv-scanner:v2.6.0@sha256:afd838850ac1a0fcc15ff4a041dc9ba11123c3f0d2666217a5f0fcf9222b55fa
+  GITLEAKS_IMAGE: zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+  SEMGREP_IMAGE: semgrep/semgrep:1.180.0@sha256:529ee8a277ec8adc5b534d7c74eea0a47e9de21d62852b6ba7ac6ba9566845c3
+  TRIVY_IMAGE: aquasec/trivy:0.75.0@sha256:af6acf9a6b85dfe389a1941505c0ce9efef52a4719635e1a962f022a3d855daa
+  # renovate: datasource=maven depName=org.cyclonedx:cyclonedx-maven-plugin
+  CYCLONEDX_MAVEN_VERSION: 2.9.3
+
+jobs:
+  maven:
+    name: Dependencies — Maven (OSV-Scanner)
+    if: inputs.maven-dir != ''
+    runs-on: ubuntu-latest
+    outputs:
+      findings: ${{ steps.scan.outputs.findings }}
+    env:
+      MAVEN_DIR: ${{ inputs.maven-dir }}
+      OSV_CONFIG: ${{ inputs.osv-config }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: temurin
+          cache: maven
+          cache-dependency-path: ${{ inputs.maven-dir }}/pom.xml
+
+      - name: Build runtime SBOM
+        working-directory: ${{ inputs.maven-dir }}
+        run: |
+          mvn=mvn
+          if [ -x ./mvnw ]; then mvn=./mvnw; fi
+          "$mvn" -B -q "org.cyclonedx:cyclonedx-maven-plugin:${CYCLONEDX_MAVEN_VERSION}:makeAggregateBom" \
+            -DincludeTestScope=false -DoutputFormat=json -DoutputName=bom
+
+      - name: Scan SBOM
+        id: scan
+        run: |
+          mkdir -p "$RUNNER_TEMP/sarif"
+          config=()
+          if [ -z "$OSV_CONFIG" ] && [ -f "$MAVEN_DIR/osv-scanner.toml" ]; then OSV_CONFIG="$MAVEN_DIR/osv-scanner.toml"; fi
+          if [ -n "$OSV_CONFIG" ]; then config=(--config "/repo/$OSV_CONFIG"); fi
+          osv() {
+            docker run --rm -v "$PWD:/repo:ro" -v "$RUNNER_TEMP/sarif:/out" "$OSV_SCANNER_IMAGE" \
+              scan source -L "/repo/$MAVEN_DIR/target/bom.json" "${config[@]}" "$@"
+          }
+
+          # Exit codes: 0 clean, 1 vulnerabilities found, 128 no packages found. Anything else is an error.
+          status=0
+          osv --format table || status=$?
+          if [ "$status" -gt 1 ] && [ "$status" -ne 128 ]; then echo "::error::OSV-Scanner failed (exit $status)"; exit "$status"; fi
+          osv --format sarif --output-file /out/osv.sarif >/dev/null 2>&1 || true
+
+          findings=0
+          if [ -f "$RUNNER_TEMP/sarif/osv.sarif" ]; then
+            # Point results at the pom.xml rather than the SBOM path inside the container.
+            jq --arg uri "$MAVEN_DIR/pom.xml" \
+              '(.runs[].results[].locations[]?.physicalLocation.artifactLocation) |= {uri: $uri}' \
+              "$RUNNER_TEMP/sarif/osv.sarif" > "$RUNNER_TEMP/osv.sarif" && mv "$RUNNER_TEMP/osv.sarif" "$RUNNER_TEMP/sarif/osv.sarif"
+            findings=$(jq '[.runs[].results | length] | add // 0' "$RUNNER_TEMP/sarif/osv.sarif")
+          fi
+          echo "findings=$findings" >> "$GITHUB_OUTPUT"
+          if [ "$findings" -gt 0 ]; then echo "::warning title=Maven dependencies::$findings vulnerable package(s), see the table above"; fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: ${{ inputs.artifact-prefix }}-sarif-osv
+          path: ${{ runner.temp }}/sarif/osv.sarif
+          if-no-files-found: ignore
+          retention-days: 7
+
+  npm:
+    name: Dependencies — npm audit
+    if: inputs.npm-dir != ''
+    runs-on: ubuntu-latest
+    outputs:
+      findings: ${{ steps.scan.outputs.findings }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          package-manager-cache: false
+
+      - name: Audit production dependencies
+        id: scan
+        working-directory: ${{ inputs.npm-dir }}
+        env:
+          LEVEL: ${{ inputs.npm-audit-level }}
+        run: |
+          # Production dependencies only: build and test tooling never ships.
+          npm audit --omit=dev --audit-level="$LEVEL" || true
+          npm audit --omit=dev --json > "$RUNNER_TEMP/audit.json" || true
+          if ! jq -e '.metadata.vulnerabilities' "$RUNNER_TEMP/audit.json" >/dev/null; then
+            echo "::error::npm audit failed. It needs a package-lock.json or npm-shrinkwrap.json."
+            cat "$RUNNER_TEMP/audit.json"
+            exit 1
+          fi
+          findings=$(jq --arg level "$LEVEL" '
+            ["info", "low", "moderate", "high", "critical"] as $order
+            | ($order | index($level)) as $min
+            | [.metadata.vulnerabilities | to_entries[] | .key as $k | select(($order | index($k)) >= $min) | .value]
+            | add // 0' "$RUNNER_TEMP/audit.json")
+          echo "findings=$findings" >> "$GITHUB_OUTPUT"
+          if [ "$findings" -gt 0 ]; then echo "::warning title=npm dependencies::$findings vulnerable package(s) at $LEVEL or above, see the report above"; fi
+
+  secrets:
+    name: Secrets — gitleaks
+    if: inputs.secrets-scan
+    runs-on: ubuntu-latest
+    outputs:
+      findings: ${{ steps.scan.outputs.findings }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0 # full history: a secret deleted later is still exposed
+          persist-credentials: false
+
+      - name: Scan git history
+        id: scan
+        env:
+          GITLEAKS_CONFIG: ${{ inputs.gitleaks-config }}
+          GITLEAKS_IGNORE: ${{ inputs.gitleaks-ignore }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/sarif"
+          args=()
+          if [ -f "$GITLEAKS_CONFIG" ]; then args+=(--config "/repo/$GITLEAKS_CONFIG"); fi
+          if [ -f "$GITLEAKS_IGNORE" ]; then args+=(--gitleaks-ignore-path "/repo/$GITLEAKS_IGNORE"); fi
+
+          # Exit codes: 0 clean, 1 leaks found. Anything else is an error. --redact keeps secrets out of the log.
+          status=0
+          docker run --rm -v "$PWD:/repo:ro" -v "$RUNNER_TEMP/sarif:/out" "$GITLEAKS_IMAGE" \
+            git /repo "${args[@]}" --redact --no-banner --verbose \
+            --report-format sarif --report-path /out/gitleaks.sarif || status=$?
+          if [ "$status" -gt 1 ]; then echo "::error::gitleaks failed (exit $status)"; exit "$status"; fi
+
+          findings=$(jq '[.runs[].results | length] | add // 0' "$RUNNER_TEMP/sarif/gitleaks.sarif")
+          echo "findings=$findings" >> "$GITHUB_OUTPUT"
+          if [ "$findings" -gt 0 ]; then
+            echo "::warning title=Secrets::$findings secret(s) in git history. Rotate each one: deleting it in a new commit leaves it in history."
+          fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: ${{ inputs.artifact-prefix }}-sarif-gitleaks
+          path: ${{ runner.temp }}/sarif/gitleaks.sarif
+          if-no-files-found: ignore
+          retention-days: 7
+
+  code:
+    name: Code — Semgrep
+    if: inputs.code-scan
+    runs-on: ubuntu-latest
+    outputs:
+      findings: ${{ steps.scan.outputs.findings }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Scan source
+        id: scan
+        env:
+          SOURCE_DIR: ${{ inputs.source-dir }}
+          SEMGREP_CONFIG: ${{ inputs.semgrep-config }}
+          SEMGREP_SEVERITY: ${{ inputs.semgrep-severity }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/sarif"
+          configs=()
+          for pack in $SEMGREP_CONFIG; do configs+=(--config "$pack"); done
+
+          # Runs from the repo root so .semgrepignore applies and SARIF paths are repo-relative.
+          # Without --error, a non-zero exit means Semgrep itself failed.
+          docker run --rm -v "$PWD:/src:ro" -v "$RUNNER_TEMP/sarif:/out" -w /src "$SEMGREP_IMAGE" \
+            semgrep scan --metrics=off "${configs[@]}" --severity "$SEMGREP_SEVERITY" \
+            --sarif-output=/out/semgrep.sarif "$SOURCE_DIR"
+
+          findings=$(jq '[.runs[].results | length] | add // 0' "$RUNNER_TEMP/sarif/semgrep.sarif")
+          echo "findings=$findings" >> "$GITHUB_OUTPUT"
+          if [ "$findings" -gt 0 ]; then echo "::warning title=Code::$findings Semgrep finding(s), see the log above"; fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: ${{ inputs.artifact-prefix }}-sarif-semgrep
+          path: ${{ runner.temp }}/sarif/semgrep.sarif
+          if-no-files-found: ignore
+          retention-days: 7
+
+  image:
+    name: Container image — Trivy
+    if: inputs.image-context != ''
+    runs-on: ubuntu-latest
+    outputs:
+      findings: ${{ steps.scan.outputs.findings }}
+    env:
+      IMAGE_CONTEXT: ${{ inputs.image-context }}
+      IMAGE_DOCKERFILE: ${{ inputs.image-dockerfile }}
+      TRIVY_IGNORE: ${{ inputs.trivy-ignore }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Build image
+        run: |
+          dockerfile="${IMAGE_DOCKERFILE:-$IMAGE_CONTEXT/Dockerfile}"
+          docker build -f "$dockerfile" -t "security-scan:$GITHUB_RUN_ID" "$IMAGE_CONTEXT"
+
+      - name: Scan image (OS packages + application libraries)
+        id: scan
+        run: |
+          mkdir -p "$RUNNER_TEMP/sarif"
+          dockerfile="${IMAGE_DOCKERFILE:-$IMAGE_CONTEXT/Dockerfile}"
+          ignore=()
+          if [ -f "$TRIVY_IGNORE" ]; then ignore=(--ignorefile "/repo/$TRIVY_IGNORE"); fi
+          trivy() {
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v trivy-cache:/root/.cache/trivy \
+              -v "$PWD:/repo:ro" -v "$RUNNER_TEMP:/out" "$TRIVY_IMAGE" "$@"
+          }
+
+          # Fixable HIGH/CRITICAL only: a finding with no fix available cannot be acted on yet.
+          trivy image --quiet --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed "${ignore[@]}" \
+            --format json --output /out/trivy-image.json "security-scan:$GITHUB_RUN_ID"
+          trivy convert --quiet --format table /out/trivy-image.json
+          trivy convert --quiet --format sarif --output /out/trivy-image.sarif /out/trivy-image.json
+
+          # Point results at the Dockerfile rather than the throwaway image name.
+          jq --arg uri "$dockerfile" '(.runs[].results[].locations[]?.physicalLocation.artifactLocation) |= {uri: $uri}' \
+            "$RUNNER_TEMP/trivy-image.sarif" > "$RUNNER_TEMP/sarif/trivy-image.sarif"
+          findings=$(jq '[.Results[]?.Vulnerabilities[]?] | length' "$RUNNER_TEMP/trivy-image.json")
+          echo "findings=$findings" >> "$GITHUB_OUTPUT"
+          if [ "$findings" -gt 0 ]; then echo "::warning title=Container image::$findings fixable HIGH/CRITICAL vulnerabilities, see the table above"; fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: ${{ inputs.artifact-prefix }}-sarif-trivy-image
+          path: ${{ runner.temp }}/sarif/trivy-image.sarif
+          if-no-files-found: ignore
+          retention-days: 7
+
+  config:
+    name: Config & IaC — Trivy
+    if: inputs.config-scan
+    runs-on: ubuntu-latest
+    outputs:
+      findings: ${{ steps.scan.outputs.findings }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Scan Dockerfiles, Compose, Kubernetes and IaC
+        id: scan
+        env:
+          SOURCE_DIR: ${{ inputs.source-dir }}
+          TRIVY_IGNORE: ${{ inputs.trivy-ignore }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/sarif"
+          ignore=()
+          if [ -f "$TRIVY_IGNORE" ]; then ignore=(--ignorefile "/repo/$TRIVY_IGNORE"); fi
+          trivy() {
+            docker run --rm -v trivy-cache:/root/.cache/trivy -v "$PWD:/repo:ro" -v "$RUNNER_TEMP:/out" \
+              -w /repo "$TRIVY_IMAGE" "$@"
+          }
+
+          trivy config --quiet --severity HIGH,CRITICAL "${ignore[@]}" \
+            --format json --output /out/trivy-config.json "$SOURCE_DIR"
+          trivy convert --quiet --format table /out/trivy-config.json
+          trivy convert --quiet --format sarif --output /out/trivy-config.sarif /out/trivy-config.json
+
+          # Trivy reports paths relative to the scanned folder; make them repo-relative.
+          prefix=""
+          if [ "$SOURCE_DIR" != "." ]; then prefix="${SOURCE_DIR%/}/"; fi
+          jq --arg prefix "$prefix" '(.runs[].results[].locations[]?.physicalLocation.artifactLocation.uri) |= ($prefix + .)' \
+            "$RUNNER_TEMP/trivy-config.sarif" > "$RUNNER_TEMP/sarif/trivy-config.sarif"
+          findings=$(jq '[.Results[]?.Misconfigurations[]? | select(.Status == "FAIL")] | length' "$RUNNER_TEMP/trivy-config.json")
+          echo "findings=$findings" >> "$GITHUB_OUTPUT"
+          if [ "$findings" -gt 0 ]; then echo "::warning title=Config & IaC::$findings HIGH/CRITICAL misconfiguration(s), see the table above"; fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: ${{ inputs.artifact-prefix }}-sarif-trivy-config
+          path: ${{ runner.temp }}/sarif/trivy-config.sarif
+          if-no-files-found: ignore
+          retention-days: 7
+
+  verdict:
+    name: Verdict
+    if: ${{ !cancelled() }}
+    needs: [maven, npm, secrets, code, image, config]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summarise and decide
+        env:
+          FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings }}
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          {
+            echo "## Security scan"
+            echo
+            echo "| Scan | Result | Findings |"
+            echo "| --- | --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          errored=0
+          found=0
+          for scan in maven npm secrets code image config; do
+            result=$(jq -r --arg s "$scan" '.[$s].result' <<<"$NEEDS")
+            findings=$(jq -r --arg s "$scan" '.[$s].outputs.findings // ""' <<<"$NEEDS")
+            case "$result" in
+              skipped) row="⏭️ skipped | –" ;;
+              success)
+                if [ "${findings:-0}" -gt 0 ]; then row="❌ findings | $findings"; found=$((found + findings))
+                else row="✅ clean | 0"; fi ;;
+              *) row="⚠️ scanner $result | –"; errored=1 ;;
+            esac
+            echo "| $scan | $row |" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+          if [ "$errored" -eq 1 ]; then
+            echo "::error::A scanner did not finish. Open its job log: this is a tool or setup error, not a finding."
+            exit 1
+          fi
+          if [ "$found" -gt 0 ]; then
+            if [ "$FAIL_ON_FINDINGS" = "true" ]; then
+              echo "::error::$found finding(s). Open each failing scan's log for details, fix them or record an accepted exception."
+              exit 1
+            fi
+            echo "::warning::$found finding(s), report-only mode (fail-on-findings: false)."
+          fi

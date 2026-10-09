@@ -1,0 +1,9 @@
+# Gitleaks config for this repo's own history: the default rules, minus the planted demo key.
+# demo/vulnerable/ holds a fake key on purpose; the self-test scans it with
+# demo/vulnerable/gitleaks.toml, which has no allowlist, to prove gitleaks still catches it.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Deliberately planted fake key in the vulnerable demo"
+paths = ['''^demo/vulnerable/''']

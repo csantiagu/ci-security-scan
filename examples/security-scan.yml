@@ -1,0 +1,38 @@
+# Copy to .github/workflows/security-scan.yml in your repo and set the folders for your project.
+name: Security scan
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 6 * * 1" # weekly: new advisories land against code that has not changed
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    # Pin to a release commit SHA, not a tag: `@<sha> # v1.0.0`. Renovate and Dependabot keep it current.
+    uses: csantiagu/ci-security-scan/.github/workflows/scan.yml@v1
+    with:
+      maven-dir: backend       # folder with pom.xml; remove to skip
+      npm-dir: frontend        # folder with package-lock.json; remove to skip
+      image-context: backend   # Docker build context; remove to skip
+      semgrep-config: p/java p/typescript p/react p/owasp-top-ten p/secrets p/dockerfile
+
+  # Optional: findings in the Security tab and as PR annotations. Needs code scanning enabled
+  # (free on public repos). Fork PRs get a read-only token, so they skip the upload.
+  upload-sarif:
+    needs: scan
+    if: ${{ !cancelled() && !github.event.pull_request.head.repo.fork }}
+    permissions:
+      contents: read # check out the repo
+      security-events: write # upload SARIF to code scanning
+      actions: read # read the scan's SARIF artifacts
+    uses: csantiagu/ci-security-scan/.github/workflows/upload-sarif.yml@v1

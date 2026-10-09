@@ -1,0 +1,13 @@
+# Accepted Trivy findings, for both the image scan and the config scan. Put this file at the repo
+# root (or pass trivy-ignore). Each entry needs a statement; add expired_at so it cannot outlive its reason.
+
+vulnerabilities:
+  - id: CVE-0000-00000
+    statement: Affects the bundled CLI tool only, which the image never runs.
+    expired_at: 2027-01-31
+
+misconfigurations:
+  - id: DS-0002 # image runs as root
+    paths:
+      - "docker/dev/Dockerfile"
+    statement: Local development image only; never deployed.

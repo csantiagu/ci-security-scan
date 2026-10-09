@@ -1,0 +1,9 @@
+# gitleaks config: the default rules plus allowlists for patterns that are never secrets.
+# Put this file at the repo root (or pass gitleaks-config). One-off findings belong in .gitleaksignore.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Placeholder values in docs and examples, never real secrets"
+# Allowlist by pattern so edits that move these lines don't flag them again.
+regexes = ['''EXAMPLE_[A-Z0-9_]+''']

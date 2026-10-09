@@ -1,0 +1,8 @@
+# Accepted dependency vulnerabilities for OSV-Scanner. Put this file next to your pom.xml
+# (or pass osv-config). Every entry needs a reason and an expiry date: when the date passes, the
+# finding fails the build again and someone has to look at it.
+
+[[IgnoredVulns]]
+id = "GHSA-xxxx-xxxx-xxxx"
+ignoreUntil = 2027-01-31
+reason = "Only reachable through the XML parser, which we never call with untrusted input. Upgrade blocked on framework 4.2."

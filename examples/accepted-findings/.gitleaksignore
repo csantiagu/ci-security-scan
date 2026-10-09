@@ -1,0 +1,6 @@
+# Reviewed gitleaks findings. Each line is a fingerprint from the gitleaks log: commit:file:rule:line.
+# One line silences one finding in one commit; a new secret anywhere still fails the scan.
+# A real secret must be rotated first: removing it in a later commit leaves it in history.
+
+# Fake key used only by a unit test.
+0123456789abcdef0123456789abcdef01234567:src/test/java/com/example/WebhookTest.java:generic-api-key:21

@@ -1,0 +1,75 @@
+name: Self-test
+
+# Proves the scan both ways on every change:
+# - demo/clean must pass every scanner (no false positives from the setup itself);
+# - demo/vulnerable must be caught by every scanner (each one still finds a planted problem).
+# Runs weekly too: new advisories can turn the clean demo red, and Renovate then bumps it.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: self-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  clean:
+    name: Clean demo passes
+    uses: ./.github/workflows/scan.yml # zizmor: ignore[self-repository] -- actionlint does not support `$/` yet
+    with:
+      artifact-prefix: clean
+      maven-dir: demo/clean/backend
+      npm-dir: demo/clean/frontend
+      source-dir: demo/clean
+      image-context: demo/clean
+
+  vulnerable:
+    name: Vulnerable demo
+    uses: ./.github/workflows/scan.yml # zizmor: ignore[self-repository] -- actionlint does not support `$/` yet
+    with:
+      artifact-prefix: vulnerable
+      fail-on-findings: false
+      maven-dir: demo/vulnerable/backend
+      npm-dir: demo/vulnerable/frontend
+      source-dir: demo/vulnerable
+      image-context: demo/vulnerable
+      gitleaks-config: demo/vulnerable/gitleaks.toml # no allowlist, so the planted key is reported
+
+  vulnerable-caught:
+    name: Every scanner catches the vulnerable demo
+    needs: vulnerable
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check each scanner reported findings
+        env:
+          FINDINGS: ${{ toJSON(needs.vulnerable.outputs) }}
+        run: |
+          missed=0
+          for scan in maven npm secrets code image config; do
+            n=$(jq -r --arg k "$scan-findings" '.[$k] // ""' <<<"$FINDINGS")
+            if [ "${n:-0}" -gt 0 ]; then echo "✅ $scan: $n finding(s)"
+            else echo "::error title=$scan::reported no findings on the vulnerable demo"; missed=1; fi
+          done
+          exit "$missed"
+
+  # Shows the code scanning path working. Only the clean results are uploaded, so this repo's
+  # Security tab is not filled with the demo's deliberate alerts.
+  upload:
+    name: Upload clean results
+    needs: clean
+    if: ${{ !cancelled() && github.event_name != 'pull_request' }}
+    permissions:
+      contents: read # check out the repo
+      security-events: write # upload SARIF to code scanning
+      actions: read # read the scan's SARIF artifacts
+    uses: ./.github/workflows/upload-sarif.yml # zizmor: ignore[self-repository] -- actionlint does not support `$/` yet
+    with:
+      artifact-prefix: clean

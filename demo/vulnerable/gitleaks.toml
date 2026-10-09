@@ -1,0 +1,3 @@
+# The default rules with no allowlist, so the planted demo key is reported.
+[extend]
+useDefault = true
